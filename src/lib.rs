@@ -34,7 +34,7 @@ impl SubtaskType {
 }
 
 pub struct TaskProgress {
-    total: usize,
+    total: Option<usize>,
     progress: usize,
     expected: usize,
     state: TaskState,
@@ -60,16 +60,15 @@ impl TaskProgress {
             Err(TaskError::AlreadyCompleted)
         } else {
             let new_progress = this_.progress + progress;
-            if new_progress > this_.total {
+            if this_.total.is_some() && new_progress > this_.total.unwrap() {
                 Err(TaskError::ProgressPastTotal)
             } else {
                 this_.expected -= progress;
                 let old_progress = this_.progress;
                 this_.progress = new_progress;
                 // update parent progress
-                if let Some((parent_total, parent)) = &this_.parent {
+                if let (Some(total), Some((parent_total, parent))) = (this_.total, &this_.parent) {
                     let parent = parent.clone();
-                    let total = this_.total;
                     let parent_total = parent_total.amount();
                     std::mem::drop(this_);
                     let parent_progress = parent_total * new_progress / total;
@@ -90,24 +89,27 @@ impl TaskProgress {
             Err(TaskError::AlreadyCompleted)
         } else {
             let new_progress = this_.progress + progress;
-            if new_progress > this_.total {
-                Err(TaskError::ProgressPastTotal)
-            } else {
-                let old_progress = this_.progress;
-                this_.progress = new_progress;
-                // update parent progress
-                if let Some((parent_total, parent)) = &this_.parent {
-                    let parent = parent.clone();
-                    let total = this_.total;
-                    let parent_total = parent_total.amount();
-                    std::mem::drop(this_);
-                    let parent_progress = parent_total * new_progress / total;
-                    let reported_progress = parent_total * old_progress / total;
-                    let dif = parent_progress - reported_progress;
-                    TaskProgress::progress_from_subtask(&parent, dif)?;
+            if let Some(total) = this_.total {
+                if new_progress > total {
+                    return Err(TaskError::ProgressPastTotal);
+                } else {
+                    let old_progress = this_.progress;
+                    this_.progress = new_progress;
+                    // update parent progress
+                    if let Some((parent_total, parent)) = &this_.parent {
+                        let parent = parent.clone();
+                        let parent_total = parent_total.amount();
+                        std::mem::drop(this_);
+                        let parent_progress = parent_total * new_progress / total;
+                        let reported_progress = parent_total * old_progress / total;
+                        let dif = parent_progress - reported_progress;
+                        TaskProgress::progress_from_subtask(&parent, dif)?;
+                    }
                 }
-                Ok(())
+            } else {
+                this_.progress = new_progress;
             }
+            Ok(())
         }
     }
 
@@ -139,17 +141,26 @@ impl TaskProgress {
             this_.state = TaskState::Completed;
             this_.cancel_uncompleted_subtasks()?;
             let old_progress = this_.progress;
-            this_.progress = this_.total;
-            if let Some((parent_total, parent)) = this_.parent.clone() {
-                let parent_progress = parent_total.amount();
-                let reported_progress = parent_total.amount() * old_progress / this_.total;
-                let dif = parent_progress - reported_progress;
+            if let Some(total) = this_.total {
+                this_.progress = total;
+                if let Some((parent_total, parent)) = this_.parent.clone() {
+                    let parent_progress = parent_total.amount();
+                    let reported_progress = parent_total.amount() * old_progress / total;
+                    let dif = parent_progress - reported_progress;
 
+                    // drop our current lock to prevent deadlocks
+                    std::mem::drop(this_);
+
+                    // complete the progress bar
+                    TaskProgress::progress_from_subtask(&parent, dif)?;
+                }
+            } else if let Some((parent_total, parent)) = this_.parent.clone() {
                 // drop our current lock to prevent deadlocks
                 std::mem::drop(this_);
-
-                // complete the progress bar
-                TaskProgress::progress_from_subtask(&parent, dif)?;
+                // since we could not estimate progress before
+                // completing, this is the first time we post progress
+                // to parent. Report everything.
+                TaskProgress::progress_from_subtask(&parent, parent_total.amount())?;
             }
 
             Ok(())
@@ -256,7 +267,7 @@ impl TaskProgress {
             Err(TaskError::NotStarted)
         } else {
             let new_expected = self.expected + size;
-            if new_expected > self.total {
+            if self.total.is_some() && new_expected > self.total.unwrap() {
                 Err(TaskError::ExpectedPastTotal)
             } else {
                 self.subtask_progress.push(progress);
@@ -283,9 +294,9 @@ pub enum TaskError {
 }
 
 impl Task {
-    pub fn new(total: usize, mut subtasks: Vec<(usize, Task)>) -> Self {
+    pub fn new(total: Option<usize>, mut subtasks: Vec<(usize, Task)>) -> Self {
         assert!(
-            subtasks.iter().map(|(x, _)| *x).sum::<usize>() <= total,
+            total.is_none() || subtasks.iter().map(|(x, _)| *x).sum::<usize>() <= total.unwrap(),
             "total subtasks size is greater than the total work given"
         );
         let progress = Arc::new(RwLock::new(TaskProgress {
@@ -370,7 +381,7 @@ impl StartedTask {
     pub fn start_dynamic_subtask(
         &self,
         size: usize,
-        inner_size: usize,
+        inner_size: Option<usize>,
         subtasks: Vec<(usize, Task)>,
     ) -> Result<StartedTask, TaskError> {
         let subtask = Task::new(inner_size, subtasks);
@@ -390,7 +401,7 @@ mod tests {
 
     #[test]
     fn single_task_progress() {
-        let task = Task::new(100, vec![]);
+        let task = Task::new(Some(100), vec![]);
         let started = task.start().unwrap();
 
         assert_eq!(0, task.current_progress());
@@ -407,7 +418,7 @@ mod tests {
 
     #[test]
     fn nested_task_progress() {
-        let task = Task::new(100, vec![(50, Task::new(100, vec![]))]);
+        let task = Task::new(Some(100), vec![(50, Task::new(Some(100), vec![]))]);
         let started = task.start().unwrap();
 
         assert_eq!(0, task.current_progress());
@@ -435,8 +446,11 @@ mod tests {
     #[test]
     fn twice_nested_task_progress() {
         let task = Task::new(
-            128,
-            vec![(64, Task::new(128, vec![(64, Task::new(128, vec![]))]))],
+            Some(128),
+            vec![(
+                64,
+                Task::new(Some(128), vec![(64, Task::new(Some(128), vec![]))]),
+            )],
         );
         let started = task.start().unwrap();
         let (_, subtask) = &task.subtasks[0];
@@ -462,5 +476,33 @@ mod tests {
         assert_eq!(128, subsubtask.current_progress());
         assert_eq!(128, subtask.current_progress());
         assert_eq!(128, task.current_progress());
+    }
+
+    #[test]
+    fn unbounded_task() {
+        let task = Task::new(None, vec![]);
+        let started = task.start().unwrap();
+
+        assert_eq!(0, task.current_progress());
+        assert_eq!(0, started.current_progress());
+        started.progress(15).unwrap();
+        assert_eq!(15, started.current_progress());
+        started.progress(12345).unwrap();
+        assert_eq!(12360, started.current_progress());
+    }
+
+    #[test]
+    fn unbounded_subtask() {
+        let task = Task::new(Some(100), vec![(50, Task::new(None, vec![]))]);
+        let started = task.start().unwrap();
+        let started_subtask = started.start_subtask(0).unwrap();
+
+        assert_eq!(0, started.current_progress());
+        assert_eq!(0, started_subtask.current_progress());
+        started_subtask.progress(12345).unwrap();
+        assert_eq!(0, started.current_progress());
+        assert_eq!(12345, started_subtask.current_progress());
+        started_subtask.complete().unwrap();
+        assert_eq!(50, started.current_progress());
     }
 }
